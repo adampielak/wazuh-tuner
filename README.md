@@ -9,6 +9,26 @@ Web UI for tuning Wazuh 4.x `local_internal_options.conf` — generates ready-to
 - Generates `/var/ossec/etc/local_internal_options.conf` (full or changed-only diff)
 - **System Hints** tab computes the required OS-level changes that must accompany your parameter choices: `sysctl.d`, `security/limits.conf`, systemd unit override
 
+## Screenshots
+
+### Overview — sidebar navigation and preset selection
+![Overview](screenshots/01-overview.png)
+
+### Analysis Daemon parameters — sliders with sysctl/systemd hints
+![analysisd](screenshots/02-analysisd.png)
+
+### Medium preset applied — changed parameters highlighted in blue
+![Medium preset](screenshots/03-preset-medium.png)
+
+### Generate Config — copy or download ready local_internal_options.conf
+![Generate Config](screenshots/04-generate-config.png)
+
+### System Hints — computed sysctl.d, limits.conf and systemd override
+![System Hints](screenshots/05-system-hints.png)
+
+### Remote Daemon — TCP keepalive, buffer sizes, rlimit_nofile
+![remoted](screenshots/06-remoted.png)
+
 ## Why
 
 `internal_options.conf` is overwritten on every Wazuh upgrade. Changes must go in `local_internal_options.conf`. Many parameters (FD limits, buffer sizes, inotify watches) also require kernel or systemd changes — the UI surfaces those automatically.
