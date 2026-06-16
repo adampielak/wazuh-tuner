@@ -1,6 +1,24 @@
 # wazuh-tuner
 
-Web UI for tuning Wazuh 4.x `local_internal_options.conf` — generates ready-to-deploy config with matching OS-level hints (sysctl / limits.conf / systemd).
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![Flask](https://img.shields.io/badge/flask-3.x-lightgrey)
+![Wazuh](https://img.shields.io/badge/wazuh-4.x-005571)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+Web UI for tuning Wazuh 4.x `local_internal_options.conf` — generates a ready-to-deploy config with matching OS-level hints (sysctl / limits.conf / systemd).
+
+> `internal_options.conf` is overwritten on every Wazuh upgrade. Changes belong in `local_internal_options.conf`. Many parameters (FD limits, buffer sizes, inotify watches) also require kernel or systemd changes — the UI surfaces those automatically.
+
+## Quick start
+
+```bash
+git clone https://github.com/adampielak/wazuh-tuner.git
+cd wazuh-tuner
+pip3 install flask
+python3 wazuh-tuner.py
+```
+
+Open `http://localhost:7437` in a browser.
 
 ## What it does
 
@@ -28,10 +46,6 @@ Web UI for tuning Wazuh 4.x `local_internal_options.conf` — generates ready-to
 
 ### Remote Daemon — TCP keepalive, buffer sizes, rlimit_nofile
 ![remoted](screenshots/06-remoted.png)
-
-## Why
-
-`internal_options.conf` is overwritten on every Wazuh upgrade. Changes must go in `local_internal_options.conf`. Many parameters (FD limits, buffer sizes, inotify watches) also require kernel or systemd changes — the UI surfaces those automatically.
 
 ## Sections covered
 
@@ -65,27 +79,6 @@ Based on current parameter values the UI generates:
 - `/etc/systemd/system/wazuh-manager.service.d/override.conf` with `LimitNOFILE`
 - Ordered apply steps (sysctl → limits → systemd → restart)
 
-## Requirements
-
-```
-python3
-flask
-```
-
-Install:
-
-```bash
-pip3 install flask
-```
-
-## Run
-
-```bash
-python3 wazuh-tuner.py
-```
-
-Open `http://localhost:7437` in a browser.
-
 ## Deploy config
 
 1. Tune parameters in the UI
@@ -100,6 +93,10 @@ Open `http://localhost:7437` in a browser.
 - `debug=2` generates extreme log volume; never leave in prod
 - FD limit parameters require both `LimitNOFILE` in systemd **and** `fs.file-max` sysctl — the UI shows both
 - Tested against Wazuh 4.14.5
+
+## License
+
+MIT
 
 ## Author
 
