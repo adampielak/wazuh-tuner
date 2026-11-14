@@ -2,6 +2,7 @@
 
 ## 2026-11-14
 
+- README: link to wazuh5-tuner for Wazuh 5; license badge and section corrected to Apache-2.0 (matches LICENSE).
 - Rewrite: one file, Python standard library only, Flask dependency removed.
 - Parameter table checked against Wazuh 4.14.10 source: 81 options, defaults and ranges.
 - Fixed wrong names and ranges (`remoted.control_msg_queue_size`, `wazuh_modules.task_nice` 0..19, `wazuh_modules.rlimit_nofile` min 8192, `syscheck.rt_delay`, `logcollector.max_lines`).

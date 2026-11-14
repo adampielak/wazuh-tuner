@@ -2,13 +2,16 @@
 
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Wazuh](https://img.shields.io/badge/wazuh-4.14.10-005571)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 Local web UI that writes `/var/ossec/etc/local_internal_options.conf` for a Wazuh manager.
 It lists 81 manager options with the defaults and ranges taken from the Wazuh 4.14.10 source,
 blocks values the daemons would reject, and shows the commands to apply and check the result.
 
 One file, Python standard library only, no install step.
+
+For Wazuh 5 (`/etc/wazuh-manager/wazuh-manager-internal-options.conf`) use
+[wazuh5-tuner](https://github.com/adampielak/wazuh5-tuner).
 
 ## Why ranges matter
 
@@ -129,7 +132,7 @@ the UI. `logcollector` and `syscheck` here affect the manager's own collection, 
 
 ## License
 
-MIT
+Apache-2.0
 
 ## Author
 
