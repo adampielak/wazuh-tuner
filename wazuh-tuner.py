@@ -1,384 +1,298 @@
 #!/usr/bin/env python3
-"""Wazuh local_internal_options.conf tuning UI.
+"""Wazuh manager local_internal_options.conf tuning UI.
 
-Created by tick <tick@linuxmafia.pl>
+Parameter names, defaults and ranges match the getDefine_Int() calls in the
+Wazuh v4.14.10 source. A value outside the range, or one that is not a plain
+non-negative integer, makes the daemon exit at start.
+
+Run:   python3 wazuh-tuner.py [--host 127.0.0.1] [--port 7437]
+Check: python3 wazuh-tuner.py --check /var/ossec/etc/internal_options.conf
 """
+import argparse
 import json
-from flask import Flask, render_template_string, request, jsonify
+import re
+import socketserver
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-app = Flask(__name__)
+WAZUH_VERSION = "4.14.10"
+
+
+def p(key, default, lo, hi, desc):
+    return {"key": key, "default": default, "min": lo, "max": hi, "desc": desc}
+
+
+QUEUE_MAX = 2000000
 
 PARAMS = {
     "analysisd": {
-        "label": "Analysis Daemon (analysisd)",
-        "desc": "Core event processing, decoding, rule matching.",
+        "label": "Analysis Daemon (wazuh-analysisd)",
+        "desc": "Decoding and rule matching. Thread count 0 means one thread per CPU core for that pool. "
+                "Watch /var/ossec/var/run/wazuh-analysisd.state: a growing *_dropped counter names the queue to raise.",
         "params": [
-            {"key": "analysisd.event_threads", "default": 0, "min": 0, "max": 32, "type": "int",
-             "desc": "Event decoder threads (0=auto). Increase on multi-core for high EPS.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.rule_matching_threads", "default": 0, "min": 0, "max": 32, "type": "int",
-             "desc": "Rule evaluation threads (0=auto).",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.syscheck_threads", "default": 0, "min": 0, "max": 32, "type": "int",
-             "desc": "FIM event decoder threads.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.syscollector_threads", "default": 0, "min": 0, "max": 32, "type": "int",
-             "desc": "Syscollector decoder threads.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.dbsync_threads", "default": 0, "min": 0, "max": 32, "type": "int",
-             "desc": "DB sync dispatcher threads.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.decode_event_queue_size", "default": 16384, "min": 128, "max": 2000000, "type": "int",
-             "desc": "Event decode queue depth. Increase if wazuh-analysisd.state shows drops.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.decode_syscheck_queue_size", "default": 16384, "min": 128, "max": 2000000, "type": "int",
-             "desc": "FIM decode queue depth.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.alerts_queue_size", "default": 16384, "min": 128, "max": 2000000, "type": "int",
-             "desc": "Alerts output queue. Raise if alerts are dropped before writing.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.decode_output_queue_size", "default": 16384, "min": 128, "max": 2000000, "type": "int",
-             "desc": "Output stage queue.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.archives_queue_size", "default": 16384, "min": 128, "max": 2000000, "type": "int",
-             "desc": "Archives log queue.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.rlimit_nofile", "default": 458752, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "FD limit for analysisd process.",
-             "sysctl": "fs.file-max must be higher than this value",
-             "systemd": "LimitNOFILE in wazuh-manager.service override"},
-            {"key": "analysisd.default_timeframe", "default": 360, "min": 60, "max": 360, "type": "int",
-             "desc": "Rule correlation window in seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.decoder_order_size", "default": 256, "min": 32, "max": 1024, "type": "int",
-             "desc": "Max fields per decoder order tag.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.min_rotate_interval", "default": 600, "min": 10, "max": 86400, "type": "int",
-             "desc": "Min seconds between log rotations.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.state_interval", "default": 5, "min": 0, "max": 86400, "type": "int",
-             "desc": "State file update interval seconds (0=off). Watch wazuh-analysisd.state for queue drops.",
-             "sysctl": "", "systemd": ""},
-            {"key": "analysisd.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity (0=off, 1=basic, 2=verbose). Never leave at 2 in prod.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("analysisd.event_threads", 0, 0, 32, "Decoder threads for log events (0 = CPU cores)."),
+            p("analysisd.syscheck_threads", 0, 0, 32, "Decoder threads for FIM events (0 = CPU cores)."),
+            p("analysisd.syscollector_threads", 0, 0, 32, "Decoder threads for syscollector events (0 = CPU cores)."),
+            p("analysisd.rootcheck_threads", 0, 0, 32, "Decoder threads for rootcheck events (0 = CPU cores)."),
+            p("analysisd.sca_threads", 0, 0, 32, "Decoder threads for SCA events (0 = CPU cores)."),
+            p("analysisd.hostinfo_threads", 0, 0, 32, "Decoder threads for hostinfo events (0 = CPU cores)."),
+            p("analysisd.winevt_threads", 0, 0, 32, "Decoder threads for Windows eventchannel events (0 = CPU cores)."),
+            p("analysisd.rule_matching_threads", 0, 0, 32, "Rule matching threads (0 = CPU cores)."),
+            p("analysisd.dbsync_threads", 0, 0, 32, "Database synchronization dispatcher threads (0 = CPU cores)."),
+            p("analysisd.decode_event_queue_size", 16384, 128, QUEUE_MAX,
+              "Input queue for log events. Raise when events_dropped grows during bursts."),
+            p("analysisd.decode_syscheck_queue_size", 16384, 128, QUEUE_MAX, "Input queue for FIM events."),
+            p("analysisd.decode_syscollector_queue_size", 16384, 128, QUEUE_MAX, "Input queue for syscollector events."),
+            p("analysisd.decode_rootcheck_queue_size", 16384, 128, QUEUE_MAX,
+              "Input queue for rootcheck events. Agents started together run rootcheck in the same minute "
+              "(default frequency 12 h) and can overflow it."),
+            p("analysisd.decode_sca_queue_size", 16384, 128, QUEUE_MAX, "Input queue for SCA events."),
+            p("analysisd.decode_hostinfo_queue_size", 16384, 128, QUEUE_MAX, "Input queue for hostinfo events."),
+            p("analysisd.decode_winevt_queue_size", 16384, 128, QUEUE_MAX, "Input queue for Windows eventchannel events."),
+            p("analysisd.dbsync_queue_size", 16384, 128, QUEUE_MAX, "Input queue for database synchronization messages."),
+            p("analysisd.decode_output_queue_size", 16384, 128, QUEUE_MAX, "Queue between decoders and rule matching."),
+            p("analysisd.alerts_queue_size", 16384, 128, QUEUE_MAX, "Writer queue for alerts.log / alerts.json."),
+            p("analysisd.archives_queue_size", 16384, 128, QUEUE_MAX,
+              "Writer queue for archives. Only used when logall or logall_json is on."),
+            p("analysisd.rlimit_nofile", 458752, 1024, 1048576,
+              "Open file limit. The daemon calls setrlimit() as root before it drops privileges."),
+            p("analysisd.default_timeframe", 360, 60, 3600, "Default rule timeframe in seconds."),
+            p("analysisd.decoder_order_size", 256, 32, 1024, "Maximum fields in a decoder <order> tag."),
+            p("analysisd.min_rotate_interval", 600, 10, 86400, "Minimum seconds between output file rotations."),
+            p("analysisd.state_interval", 5, 0, 86400, "Seconds between wazuh-analysisd.state updates (0 = off)."),
+            p("analysisd.debug", 0, 0, 2, "Debug level. 2 floods ossec.log; do not keep it in production."),
+        ],
     },
     "remoted": {
-        "label": "Remote Daemon (remoted)",
-        "desc": "Agent communication, TCP/UDP, message queuing.",
+        "label": "Remote Daemon (wazuh-remoted)",
+        "desc": "Agent connections. Watch /var/ossec/var/run/wazuh-remoted.state for discarded messages and queue_size.",
         "params": [
-            {"key": "remoted.worker_pool", "default": 4, "min": 1, "max": 16, "type": "int",
-             "desc": "Payload reception threads. Scale with agent count.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.sender_pool", "default": 8, "min": 1, "max": 64, "type": "int",
-             "desc": "Shared file sender threads.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.request_pool", "default": 1024, "min": 1, "max": 4096, "type": "int",
-             "desc": "Parallel request dispatchers.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.send_buffer_size", "default": 131072, "min": 65536, "max": 1048576, "type": "int",
-             "desc": "Per-agent TCP send queue bytes.",
-             "sysctl": "net.core.wmem_max must be >= this value",
-             "systemd": ""},
-            {"key": "remoted.ctrl_msg_queue_size", "default": 16384, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "Max queued control messages.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.rlimit_nofile", "default": 16384, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "FD limit for remoted. One FD per connected agent plus extras.",
-             "sysctl": "fs.file-max must accommodate this",
-             "systemd": "LimitNOFILE in wazuh-manager.service override"},
-            {"key": "remoted.receive_chunk", "default": 4096, "min": 1024, "max": 16384, "type": "int",
-             "desc": "TCP recv buffer bytes.",
-             "sysctl": "net.core.rmem_max",
-             "systemd": ""},
-            {"key": "remoted.send_chunk", "default": 4096, "min": 512, "max": 16384, "type": "int",
-             "desc": "TCP send buffer bytes.",
-             "sysctl": "net.core.wmem_max",
-             "systemd": ""},
-            {"key": "remoted.tcp_keepidle", "default": 30, "min": 1, "max": 7200, "type": "int",
-             "desc": "Idle seconds before TCP keepalive probes start.",
-             "sysctl": "net.ipv4.tcp_keepalive_time (kernel default; remoted overrides per-socket)",
-             "systemd": ""},
-            {"key": "remoted.tcp_keepintvl", "default": 10, "min": 1, "max": 100, "type": "int",
-             "desc": "Seconds between keepalive probes.",
-             "sysctl": "net.ipv4.tcp_keepalive_intvl",
-             "systemd": ""},
-            {"key": "remoted.tcp_keepcnt", "default": 3, "min": 1, "max": 50, "type": "int",
-             "desc": "Probes before dropping connection.",
-             "sysctl": "net.ipv4.tcp_keepalive_probes",
-             "systemd": ""},
-            {"key": "remoted.keyupdate_interval", "default": 10, "min": 1, "max": 3600, "type": "int",
-             "desc": "Seconds to reload client.keys after change.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.shared_reload", "default": 10, "min": 1, "max": 18000, "type": "int",
-             "desc": "Shared file reload interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.state_interval", "default": 5, "min": 0, "max": 86400, "type": "int",
-             "desc": "State file update interval (watch wazuh-remoted.state for discarded events).",
-             "sysctl": "", "systemd": ""},
-            {"key": "remoted.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("remoted.worker_pool", 4, 1, 16, "Threads that process received agent messages."),
+            p("remoted.sender_pool", 8, 1, 64, "Threads that send shared files to agents."),
+            p("remoted.request_pool", 1024, 1, 4096, "Limit of parallel request dispatchers."),
+            p("remoted.send_buffer_size", 131072, 65536, 1048576,
+              "Per-agent outgoing queue in bytes, kept in user space. It is not a socket buffer."),
+            p("remoted.control_msg_queue_size", 16384, 4096, 1048576, "Queue for agent control (keepalive) messages."),
+            p("remoted.rlimit_nofile", 458752, 1024, 1048576,
+              "Open file limit. Each TCP agent holds one descriptor."),
+            p("remoted.receive_chunk", 4096, 1024, 16384, "TCP read size in bytes. Use a power of two."),
+            p("remoted.send_chunk", 4096, 512, 16384, "TCP write size in bytes. Use a power of two."),
+            p("remoted.tcp_keepidle", 30, 1, 7200, "Idle seconds before keepalive probes. Set per socket, kernel sysctl not used."),
+            p("remoted.tcp_keepintvl", 10, 1, 100, "Seconds between keepalive probes."),
+            p("remoted.tcp_keepcnt", 3, 1, 50, "Failed probes before the connection is dropped."),
+            p("remoted.keyupdate_interval", 10, 1, 3600, "Seconds between client.keys reload checks."),
+            p("remoted.shared_reload", 10, 1, 18000, "Seconds between shared file (agent groups) reloads."),
+            p("remoted.state_interval", 5, 0, 86400, "Seconds between wazuh-remoted.state updates (0 = off)."),
+            p("remoted.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "wazuh_db": {
         "label": "Wazuh DB (wazuh-db)",
-        "desc": "SQLite agent database daemon.",
+        "desc": "Per-agent SQLite databases. Slow storage shows here first; tuning only hides it.",
         "params": [
-            {"key": "wazuh_db.worker_pool_size", "default": 8, "min": 1, "max": 32, "type": "int",
-             "desc": "Worker threads. Scale with agent count.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.open_db_limit", "default": 64, "min": 1, "max": 4096, "type": "int",
-             "desc": "Max simultaneously open SQLite DBs (LRU eviction above limit).",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.rlimit_nofile", "default": 65536, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "FD limit for wazuh-db.",
-             "sysctl": "fs.file-max must accommodate this",
-             "systemd": "LimitNOFILE in wazuh-manager.service override"},
-            {"key": "wazuh_db.commit_time_min", "default": 10, "min": 1, "max": 3600, "type": "int",
-             "desc": "Min seconds before DB commit (lower = more I/O, less data loss on crash).",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.commit_time_max", "default": 60, "min": 1, "max": 3600, "type": "int",
-             "desc": "Max seconds before forced commit.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.max_fragmentation", "default": 90, "min": 0, "max": 100, "type": "int",
-             "desc": "DB fragmentation % ceiling before VACUUM.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.fragmentation_threshold", "default": 75, "min": 0, "max": 100, "type": "int",
-             "desc": "Fragmentation % to trigger defrag.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.check_fragmentation_interval", "default": 7200, "min": 1, "max": 30758400, "type": "int",
-             "desc": "Fragmentation check interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_db.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("wazuh_db.worker_pool_size", 8, 1, 32, "Worker threads."),
+            p("wazuh_db.open_db_limit", 64, 1, 4096,
+              "Databases kept open. Above the limit the least recently used one is closed."),
+            p("wazuh_db.commit_time_min", 10, 1, 3600, "Minimum seconds before a commit."),
+            p("wazuh_db.commit_time_max", 60, 1, 3600, "Maximum seconds before a forced commit."),
+            p("wazuh_db.rlimit_nofile", 458752, 1024, 1048576, "Open file limit."),
+            p("wazuh_db.max_fragmentation", 90, 0, 100, "Fragmentation percent that always triggers VACUUM."),
+            p("wazuh_db.fragmentation_threshold", 75, 0, 100, "Fragmentation percent that allows VACUUM."),
+            p("wazuh_db.fragmentation_delta", 5, 0, 100,
+              "Fragmentation growth since the last VACUUM needed for a new one."),
+            p("wazuh_db.free_pages_percentage", 0, 0, 99, "Minimum free pages percent that can trigger VACUUM."),
+            p("wazuh_db.check_fragmentation_interval", 7200, 1, 30758400, "Seconds between fragmentation checks."),
+            p("wazuh_db.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "logcollector": {
-        "label": "Log Collector (logcollector)",
-        "desc": "File tailing, journal reading, command output collection.",
+        "label": "Log Collector (wazuh-logcollector)",
+        "desc": "The manager's own log collection (localfile in the manager ossec.conf). Agents read their own file.",
         "params": [
-            {"key": "logcollector.input_threads", "default": 4, "min": 1, "max": 128, "type": "int",
-             "desc": "File reader threads.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.queue_size", "default": 1024, "min": 128, "max": 220000, "type": "int",
-             "desc": "Output queue per socket. Raise if logcollector.state shows drops.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.max_lines", "default": 10000, "min": 100, "max": 100000, "type": "int",
-             "desc": "Max lines read per file per poll loop.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.max_files", "default": 1000, "min": 1, "max": 100000, "type": "int",
-             "desc": "Max simultaneously monitored files.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.rlimit_nofile", "default": 1100, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "FD limit -- must be > max_files + overhead.",
-             "sysctl": "fs.file-max must accommodate this",
-             "systemd": "LimitNOFILE in wazuh-manager.service override"},
-            {"key": "logcollector.loop_timeout", "default": 2, "min": 1, "max": 120, "type": "int",
-             "desc": "File poll interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.vcheck_files", "default": 64, "min": 0, "max": 1024, "type": "int",
-             "desc": "File existence check interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.sock_fail_time", "default": 300, "min": 1, "max": 3600, "type": "int",
-             "desc": "Reconnect delay on socket failure seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.state_interval", "default": 60, "min": 0, "max": 3600, "type": "int",
-             "desc": "Stats file update interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "logcollector.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("logcollector.input_threads", 4, 1, 128, "File reader threads."),
+            p("logcollector.queue_size", 1024, 128, 220000, "Output queue. Raise when the state file shows drops."),
+            p("logcollector.max_lines", 10000, 0, 1000000,
+              "Lines read from one file per loop (0 = no limit)."),
+            p("logcollector.max_files", 1000, 1, 100000, "Maximum monitored files."),
+            p("logcollector.rlimit_nofile", 1100, 1024, 1048576, "Open file limit. Must be higher than max_files."),
+            p("logcollector.loop_timeout", 2, 1, 120, "Seconds between file change checks."),
+            p("logcollector.vcheck_files", 64, 0, 1024, "Seconds between file existence and rotation checks."),
+            p("logcollector.sock_fail_time", 300, 1, 3600, "Seconds before a failed output socket is retried."),
+            p("logcollector.state_interval", 60, 0, 3600, "Seconds between state file updates (0 = off)."),
+            p("logcollector.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "syscheck": {
-        "label": "FIM / Syscheck",
-        "desc": "File integrity monitoring parameters.",
+        "label": "FIM (wazuh-syscheckd)",
+        "desc": "The manager's own file integrity monitoring.",
         "params": [
-            {"key": "syscheck.rt_delay", "default": 10, "min": 1, "max": 1000, "type": "int",
-             "desc": "Realtime alert debounce milliseconds (avoid storm on mass writes).",
-             "sysctl": "", "systemd": ""},
-            {"key": "syscheck.max_audit_entries", "default": 256, "min": 1, "max": 4096, "type": "int",
-             "desc": "Max Linux whodata (auditd) monitored dirs.",
-             "sysctl": "fs.inotify.max_user_watches must be >= this for realtime mode",
-             "systemd": ""},
-            {"key": "syscheck.default_max_depth", "default": 256, "min": 1, "max": 320, "type": "int",
-             "desc": "Max directory recursion depth.",
-             "sysctl": "", "systemd": ""},
-            {"key": "syscheck.symlink_scan_interval", "default": 600, "min": 1, "max": 2592000, "type": "int",
-             "desc": "Symlink check interval seconds.",
-             "sysctl": "", "systemd": ""},
-            {"key": "syscheck.file_max_size", "default": 1024, "min": 0, "max": 4095, "type": "int",
-             "desc": "Max file size MiB for hashing (0=unlimited).",
-             "sysctl": "", "systemd": ""},
-            {"key": "syscheck.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("syscheck.rt_delay", 5, 0, 1000, "Milliseconds of delay for real-time events (skips editor temp files)."),
+            p("syscheck.max_audit_entries", 256, 1, 4096, "Maximum directories monitored in whodata mode on Linux."),
+            p("syscheck.default_max_depth", 256, 1, 320, "Maximum recursion depth."),
+            p("syscheck.symlink_scan_interval", 600, 1, 2592000, "Seconds between checks of configured symbolic links."),
+            p("syscheck.file_max_size", 1024, 0, 4095, "Largest file hashed, in MiB (0 = no limit)."),
+            p("syscheck.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "wazuh_modules": {
-        "label": "Wazuh Modules",
-        "desc": "Vulnerability detection, SCA, Syscollector, and other modules.",
+        "label": "Modules (wazuh-modulesd)",
+        "desc": "Vulnerability detection, syscollector, SCA and other modules.",
         "params": [
-            {"key": "wazuh_modules.max_eps", "default": 100, "min": 1, "max": 1000, "type": "int",
-             "desc": "Max events/second from all modules combined.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_modules.task_nice", "default": 10, "min": -20, "max": 19, "type": "int",
-             "desc": "Process nice value (10=background, 0=normal, -20=highest priority).",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_modules.rlimit_nofile", "default": 8192, "min": 1024, "max": 1048576, "type": "int",
-             "desc": "FD limit for wazuh-modulesd.",
-             "sysctl": "fs.file-max must accommodate this",
-             "systemd": "LimitNOFILE in wazuh-manager.service override"},
-            {"key": "wazuh_modules.kill_timeout", "default": 10, "min": 0, "max": 3600, "type": "int",
-             "desc": "Grace period seconds before SIGKILL on module stop.",
-             "sysctl": "", "systemd": ""},
-            {"key": "wazuh_modules.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("wazuh_modules.max_eps", 100, 1, 1000, "Events per second sent by each module."),
+            # The parser accepts digits only, so a negative nice value stops the daemon.
+            p("wazuh_modules.task_nice", 10, 0, 19,
+              "Nice value for module tasks. Negative values stop wazuh-modulesd at start in 4.14 "
+              "(the parser rejects '-'), so the range here starts at 0."),
+            p("wazuh_modules.kill_timeout", 10, 0, 3600, "Seconds before a module child process is killed (0 = at once)."),
+            p("wazuh_modules.rlimit_nofile", 8192, 8192, 1048576, "Open file limit. Values under 8192 are rejected."),
+            p("wazuh_modules.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "monitord": {
-        "label": "Monitor Daemon (monitord)",
-        "desc": "Log rotation, agent connectivity monitoring.",
+        "label": "Monitor Daemon (wazuh-monitord)",
+        "desc": "Rotation of ossec.log and agent disconnection checks.",
         "params": [
-            {"key": "monitord.keep_log_days", "default": 31, "min": 0, "max": 500, "type": "int",
-             "desc": "Days to retain rotated logs.",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.size_rotate", "default": 512, "min": 0, "max": 4096, "type": "int",
-             "desc": "Max log size MB before rotation.",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.daily_rotations", "default": 12, "min": 1, "max": 256, "type": "int",
-             "desc": "Max log rotations per day.",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.compress", "default": 1, "min": 0, "max": 1, "type": "int",
-             "desc": "Compress rotated logs (1=yes).",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.rotate_log", "default": 1, "min": 0, "max": 1, "type": "int",
-             "desc": "Enable daily log rotation.",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.day_wait", "default": 10, "min": 0, "max": 600, "type": "int",
-             "desc": "Seconds delay before compressing/signing rotated logs.",
-             "sysctl": "", "systemd": ""},
-            {"key": "monitord.debug", "default": 0, "min": 0, "max": 2, "type": "int",
-             "desc": "Debug verbosity.",
-             "sysctl": "", "systemd": ""},
-        ]
+            p("monitord.rotate_log", 1, 0, 1, "Rotate internal logs daily."),
+            p("monitord.compress", 1, 0, 1, "Compress rotated logs."),
+            p("monitord.keep_log_days", 31, 0, 500, "Days of rotated internal logs to keep."),
+            p("monitord.size_rotate", 512, 0, 4096, "Size in MiB that triggers rotation (0 = off)."),
+            p("monitord.daily_rotations", 12, 1, 256, "Maximum rotations per day."),
+            p("monitord.day_wait", 10, 0, 600, "Seconds to wait before rotating, compressing and signing."),
+            p("monitord.debug", 0, 0, 2, "Debug level."),
+        ],
     },
     "wazuh": {
         "label": "Global (wazuh)",
-        "desc": "Global wazuh daemon settings.",
+        "desc": "Settings shared by all daemons.",
         "params": [
-            {"key": "wazuh.thread_stack_size", "default": 8192, "min": 2048, "max": 65536, "type": "int",
-             "desc": "Thread stack size KiB. Raise only if seeing stack overflows in logs.",
-             "sysctl": "",
-             "systemd": "LimitSTACK in systemd unit if raised above OS default"},
-        ]
+            p("wazuh.thread_stack_size", 8192, 2048, 65536,
+              "Thread stack in KiB, set with pthread_attr_setstacksize(). Memory use grows with "
+              "threads x stack. No ulimit or systemd change is needed."),
+        ],
     },
 }
+
+ALL_PARAMS = {x["key"]: x for s in PARAMS.values() for x in s["params"]}
 
 PRESETS = {
     "default": {
-        "label": "Default (stock)",
-        "desc": "All Wazuh defaults. Clean baseline.",
-        "values": {}
+        "label": "Default",
+        "desc": "Vendor defaults. Use it to reset.",
+        "values": {},
     },
-    "small": {
-        "label": "Small (<500 agents, <5k EPS)",
-        "desc": "Conservative settings for smaller deployments.",
+    "burst": {
+        "label": "Burst buffers",
+        "desc": "Larger analysisd input and output queues. For drops during restarts or scan bursts. "
+                "Costs memory only while the queues fill.",
         "values": {
-            "analysisd.event_threads": 2,
-            "analysisd.rule_matching_threads": 2,
-            "analysisd.decode_event_queue_size": 32768,
-            "analysisd.alerts_queue_size": 32768,
-            "remoted.worker_pool": 4,
-            "wazuh_db.worker_pool_size": 8,
-            "logcollector.queue_size": 4096,
-        }
-    },
-    "medium": {
-        "label": "Medium (500-2000 agents, 5-50k EPS)",
-        "desc": "Balanced performance for mid-size MSSP deployments.",
-        "values": {
-            "analysisd.event_threads": 4,
-            "analysisd.rule_matching_threads": 4,
-            "analysisd.syscheck_threads": 2,
-            "analysisd.dbsync_threads": 2,
-            "analysisd.decode_event_queue_size": 65536,
-            "analysisd.decode_syscheck_queue_size": 32768,
-            "analysisd.alerts_queue_size": 65536,
-            "analysisd.decode_output_queue_size": 32768,
-            "analysisd.rlimit_nofile": 458752,
-            "remoted.worker_pool": 8,
-            "remoted.sender_pool": 16,
-            "remoted.request_pool": 2048,
-            "remoted.send_buffer_size": 262144,
-            "remoted.rlimit_nofile": 65536,
-            "wazuh_db.worker_pool_size": 16,
-            "wazuh_db.open_db_limit": 256,
-            "wazuh_db.rlimit_nofile": 65536,
-            "wazuh_db.commit_time_min": 5,
-            "wazuh_db.commit_time_max": 30,
-            "logcollector.input_threads": 8,
-            "logcollector.queue_size": 16384,
-            "logcollector.max_lines": 50000,
-            "logcollector.rlimit_nofile": 8192,
-        }
-    },
-    "large": {
-        "label": "Large (>2000 agents, >50k EPS)",
-        "desc": "Aggressive tuning for high-scale Beyond/MSSP stacks.",
-        "values": {
-            "analysisd.event_threads": 8,
-            "analysisd.rule_matching_threads": 8,
-            "analysisd.syscheck_threads": 4,
-            "analysisd.syscollector_threads": 4,
-            "analysisd.dbsync_threads": 4,
             "analysisd.decode_event_queue_size": 131072,
             "analysisd.decode_syscheck_queue_size": 65536,
+            "analysisd.decode_syscollector_queue_size": 65536,
+            "analysisd.decode_rootcheck_queue_size": 65536,
+            "analysisd.decode_sca_queue_size": 65536,
+            "analysisd.decode_winevt_queue_size": 131072,
+            "analysisd.decode_output_queue_size": 131072,
             "analysisd.alerts_queue_size": 131072,
-            "analysisd.archives_queue_size": 65536,
-            "analysisd.decode_output_queue_size": 65536,
-            "analysisd.rlimit_nofile": 524288,
-            "remoted.worker_pool": 16,
-            "remoted.sender_pool": 32,
-            "remoted.request_pool": 4096,
-            "remoted.send_buffer_size": 524288,
-            "remoted.ctrl_msg_queue_size": 65536,
-            "remoted.rlimit_nofile": 131072,
-            "wazuh_db.worker_pool_size": 24,
+            "analysisd.archives_queue_size": 131072,
+        },
+    },
+    "many_agents": {
+        "label": "Many agents per node",
+        "desc": "More than about 1000 agents on one node: more remoted and wazuh-db workers, "
+                "larger control queue, more open agent databases.",
+        "values": {
+            "remoted.worker_pool": 8,
+            "remoted.sender_pool": 16,
+            "remoted.control_msg_queue_size": 65536,
+            "wazuh_db.worker_pool_size": 16,
             "wazuh_db.open_db_limit": 1024,
-            "wazuh_db.rlimit_nofile": 131072,
-            "wazuh_db.commit_time_min": 3,
-            "wazuh_db.commit_time_max": 15,
-            "logcollector.input_threads": 16,
-            "logcollector.queue_size": 65536,
-            "logcollector.max_lines": 100000,
-            "logcollector.rlimit_nofile": 32768,
-        }
+        },
+    },
+    "shared_host": {
+        "label": "Shared host",
+        "desc": "Manager next to other services. Caps analysisd pools at 4 threads each "
+                "instead of one per core.",
+        "values": {
+            "analysisd.event_threads": 4,
+            "analysisd.syscheck_threads": 2,
+            "analysisd.syscollector_threads": 2,
+            "analysisd.rootcheck_threads": 1,
+            "analysisd.sca_threads": 1,
+            "analysisd.hostinfo_threads": 1,
+            "analysisd.winevt_threads": 2,
+            "analysisd.rule_matching_threads": 4,
+            "analysisd.dbsync_threads": 2,
+        },
     },
     "debug": {
-        "label": "Debug (temporary, never prod)",
-        "desc": "All daemons at debug=1. Find issues then revert.",
-        "values": {
-            "analysisd.debug": 1,
-            "remoted.debug": 1,
-            "wazuh_db.debug": 1,
-            "logcollector.debug": 1,
-            "syscheck.debug": 1,
-            "wazuh_modules.debug": 1,
-            "monitord.debug": 1,
-        }
+        "label": "Debug (temporary)",
+        "desc": "debug=1 on every daemon. Revert after the test.",
+        "values": {k: 1 for k in ALL_PARAMS if k.endswith(".debug")},
     },
 }
 
-# Embed data as JSON in page — all rendering done via safe DOM textContent, no user input in innerHTML
+
+def validate(values):
+    """Return (clean, errors). Only known keys with in-range integers pass."""
+    clean, errors = {}, []
+    for key, raw in values.items():
+        spec = ALL_PARAMS.get(key)
+        if spec is None:
+            errors.append(f"{key}: unknown parameter")
+            continue
+        if isinstance(raw, bool) or not re.fullmatch(r"\d+", str(raw).strip()):
+            errors.append(f"{key}: '{raw}' is not a non-negative integer")
+            continue
+        v = int(str(raw).strip())
+        if not spec["min"] <= v <= spec["max"]:
+            errors.append(f"{key}: {v} outside [{spec['min']}..{spec['max']}]")
+            continue
+        clean[key] = v
+    return clean, errors
+
+
+def generate(values, changed_only=True):
+    lines = ["# /var/ossec/etc/local_internal_options.conf",
+             f"# Checked against Wazuh {WAZUH_VERSION} internal_options.conf ranges.", ""]
+    for section in PARAMS.values():
+        rows = []
+        for spec in section["params"]:
+            v = values.get(spec["key"], spec["default"])
+            if changed_only and v == spec["default"]:
+                continue
+            rows.append(f"{spec['key']}={v}")
+        if rows:
+            lines.append(f"# {section['label']}")
+            lines += rows + [""]
+    return "\n".join(lines)
+
+
+def check_defaults(path):
+    """Compare PARAMS defaults with an installed internal_options.conf."""
+    found = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = re.match(r"\s*([\w.-]+)=(\S*)", line)
+            if m:
+                found[m.group(1)] = m.group(2)
+    rc = 0
+    for key, spec in ALL_PARAMS.items():
+        if key not in found:
+            print(f"MISSING  {key} (not in {path})")
+            rc = 1
+        elif found[key] != str(spec["default"]):
+            print(f"DEFAULT  {key}: tuner {spec['default']}, file {found[key]}")
+            rc = 1
+    if rc == 0:
+        print(f"OK: {len(ALL_PARAMS)} parameters match {path}")
+    return rc
+
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wazuh Tuner</title>
 <style>
 :root {
@@ -387,41 +301,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   --warn:#d29922;--danger:#f85149;--ok:#3fb950;--code-bg:#010409;
 }
 *{box-sizing:border-box;margin:0;padding:0;}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace;font-size:14px;}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;}
 .layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh;}
 .sidebar{background:var(--surface);border-right:1px solid var(--border);padding:16px;position:sticky;top:0;height:100vh;overflow-y:auto;}
 .sidebar h2{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;}
-.nav-item{display:block;padding:8px 10px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px;cursor:pointer;margin-bottom:2px;border:none;background:none;width:100%;text-align:left;}
+.nav-item{display:block;padding:8px 10px;border-radius:6px;color:var(--muted);font-size:13px;cursor:pointer;margin-bottom:2px;border:none;background:none;width:100%;text-align:left;}
 .nav-item:hover,.nav-item.active{background:rgba(88,166,255,.15);color:var(--accent);}
+.nav-count{float:right;font-size:11px;color:var(--accent);}
 .preset-btn{display:block;width:100%;text-align:left;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px;cursor:pointer;margin-bottom:4px;}
 .preset-btn:hover{border-color:var(--accent);color:var(--accent);}
-.main{padding:24px 32px;}
+.preset-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.4;}
+.main{padding:24px 32px;max-width:1100px;}
 .section{display:none;}
 .section.active{display:block;}
 .section-header{margin-bottom:20px;}
 .section-header h1{font-size:20px;font-weight:600;margin-bottom:4px;}
-.section-header p{color:var(--muted);font-size:13px;}
+.section-header p{color:var(--muted);font-size:13px;line-height:1.5;}
 .param-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px;}
 .param-card.changed{border-color:var(--accent);}
-.param-key{font-family:monospace;font-size:13px;color:var(--accent);margin-bottom:4px;}
+.param-key{font-family:ui-monospace,monospace;font-size:13px;color:var(--accent);margin-bottom:4px;}
 .param-badge{display:inline-block;font-size:11px;padding:2px 6px;border-radius:10px;background:rgba(88,166,255,.15);color:var(--accent);margin-left:6px;}
 .param-desc{font-size:12px;color:var(--muted);margin-bottom:10px;line-height:1.5;}
-.param-hint{font-size:11px;margin-top:6px;padding:6px 8px;border-radius:4px;}
-.param-hint.sysctl{background:rgba(210,153,34,.1);border-left:3px solid var(--warn);color:var(--warn);}
-.param-hint.systemd{background:rgba(63,185,80,.1);border-left:3px solid var(--ok);color:var(--ok);}
 .input-row{display:flex;align-items:center;gap:12px;}
 .input-row input[type=range]{flex:1;accent-color:var(--accent);}
-.input-row input[type=number]{width:110px;background:var(--code-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 8px;font-size:13px;}
+.input-row input[type=number]{width:120px;background:var(--code-bg);border:1px solid var(--border);border-radius:4px;color:var(--text);padding:4px 8px;font-size:13px;}
 .range-bounds{font-size:11px;color:var(--muted);white-space:nowrap;}
 .radio-row{display:flex;gap:16px;}
 .radio-row label{display:flex;align-items:center;gap:4px;cursor:pointer;font-size:13px;}
-.output-section{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:20px;}
+.output-section{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px;}
 .output-section pre{color:var(--ok);font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all;}
 .btn{padding:8px 16px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;}
 .btn-primary{background:var(--accent);color:#000;}
-.btn-primary:hover{opacity:.85;}
 .btn-secondary{background:var(--surface);color:var(--text);border:1px solid var(--border);}
-.btn-secondary:hover{border-color:var(--accent);}
 .btn-danger{background:rgba(248,81,73,.15);color:var(--danger);border:1px solid var(--danger);}
 .toolbar{display:flex;gap:8px;margin-bottom:20px;flex-wrap:wrap;align-items:center;}
 .tab-bar{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);}
@@ -429,9 +340,9 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .tab.active{color:var(--accent);border-bottom-color:var(--accent);}
 .tab-content{display:none;}
 .tab-content.active{display:block;}
-.warn-box{background:rgba(210,153,34,.1);border:1px solid var(--warn);border-radius:6px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--warn);}
-.info-box{background:rgba(88,166,255,.1);border:1px solid var(--accent);border-radius:6px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--accent);}
-.hint-label{font-size:12px;font-weight:600;margin-bottom:6px;}
+.warn-box{background:rgba(210,153,34,.1);border:1px solid var(--warn);border-radius:6px;padding:12px 16px;margin-bottom:8px;font-size:12px;color:var(--warn);white-space:pre-line;line-height:1.5;}
+.info-box{background:rgba(88,166,255,.1);border:1px solid var(--accent);border-radius:6px;padding:12px 16px;margin-bottom:8px;font-size:12px;color:var(--accent);white-space:pre-line;line-height:1.5;}
+@media (max-width:760px){.layout{grid-template-columns:1fr;}.sidebar{position:static;height:auto;}.main{padding:16px;}}
 </style>
 </head>
 <body>
@@ -442,14 +353,17 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
     <div style="margin-top:24px">
       <h2 style="margin-bottom:8px">Presets</h2>
       <div id="presets"></div>
+      <div class="preset-note">A preset replaces all current values. Presets are starting points, not sizing rules: change one thing, measure the .state files, repeat.</div>
     </div>
   </div>
   <div class="main" id="main"></div>
 </div>
 <script>
-const PARAMS = """ + json.dumps(PARAMS) + """;
-const PRESETS = """ + json.dumps(PRESETS) + """;
-const SECTION_KEYS = """ + json.dumps(list(PARAMS.keys())) + """;
+const PARAMS = __PARAMS__;
+const PRESETS = __PRESETS__;
+const WAZUH_VERSION = __VERSION__;
+const SECTION_KEYS = Object.keys(PARAMS);
+const ALL = Object.fromEntries(Object.values(PARAMS).flatMap(s => s.params).map(p => [p.key, p]));
 let values = {};
 
 function el(tag, cls, text) {
@@ -460,20 +374,30 @@ function el(tag, cls, text) {
 }
 
 function getValue(key) {
-  const all = Object.values(PARAMS).flatMap(s => s.params);
-  const p = all.find(x => x.key === key);
-  return values[key] !== undefined ? values[key] : p.default;
+  return values[key] !== undefined ? values[key] : ALL[key].default;
+}
+
+function changedIn(sid) {
+  return PARAMS[sid].params.filter(p => getValue(p.key) !== p.default).length;
+}
+
+function refreshNav() {
+  document.querySelectorAll('.nav-item').forEach(b => {
+    const c = b.querySelector('.nav-count');
+    if (!c) return;
+    const n = changedIn(b.dataset.section);
+    c.textContent = n ? String(n) : '';
+  });
 }
 
 function buildNav() {
   const nav = document.getElementById('nav');
-  const sections = [...SECTION_KEYS, 'output', 'system'];
-  const labels = {...Object.fromEntries(SECTION_KEYS.map(k => [k, PARAMS[k].label.split(' (')[0]])),
-    output: 'Generate Config', system: 'System Hints'};
-  sections.forEach((id, i) => {
-    const btn = el('button', 'nav-item' + (i === 0 ? ' active' : ''));
-    btn.textContent = (id === 'output' ? '📄 ' : id === 'system' ? '🖥 ' : '') + labels[id];
+  const items = SECTION_KEYS.map(k => [k, PARAMS[k].label.split(' (')[0]])
+    .concat([['output', 'Generate config'], ['system', 'Apply and verify']]);
+  items.forEach(([id, label], i) => {
+    const btn = el('button', 'nav-item' + (i === 0 ? ' active' : ''), label);
     btn.dataset.section = id;
+    if (PARAMS[id]) btn.appendChild(el('span', 'nav-count'));
     btn.addEventListener('click', () => showSection(id));
     nav.appendChild(btn);
   });
@@ -482,8 +406,7 @@ function buildNav() {
 function buildPresets() {
   const cont = document.getElementById('presets');
   Object.entries(PRESETS).forEach(([id, preset]) => {
-    const btn = el('button', 'preset-btn');
-    btn.textContent = preset.label;
+    const btn = el('button', 'preset-btn', preset.label);
     btn.title = preset.desc;
     btn.addEventListener('click', () => applyPreset(id));
     cont.appendChild(btn);
@@ -493,23 +416,15 @@ function buildPresets() {
 function buildParamCard(p) {
   const card = el('div', 'param-card');
   card.id = 'card-' + p.key;
-
-  const keyLine = el('div', 'param-key');
-  keyLine.textContent = p.key;
-  const badge = el('span', 'param-badge', 'default: ' + p.default);
-  keyLine.appendChild(badge);
+  const keyLine = el('div', 'param-key', p.key);
+  keyLine.appendChild(el('span', 'param-badge', 'default ' + p.default + ', range ' + p.min + '..' + p.max));
   card.appendChild(keyLine);
-
   card.appendChild(el('div', 'param-desc', p.desc));
 
   const val = getValue(p.key);
-  const isToggle = p.min === 0 && p.max === 1;
-  const isDebug = p.min === 0 && p.max === 2;
-
-  if (isToggle || isDebug) {
+  if (p.min === 0 && (p.max === 1 || p.max === 2)) {
     const row = el('div', 'radio-row');
-    const opts = isDebug ? [0, 1, 2] : [0, 1];
-    opts.forEach(o => {
+    for (let o = 0; o <= p.max; o++) {
       const lbl = el('label');
       const inp = document.createElement('input');
       inp.type = 'radio';
@@ -520,98 +435,78 @@ function buildParamCard(p) {
       lbl.appendChild(inp);
       lbl.appendChild(document.createTextNode(' ' + o));
       row.appendChild(lbl);
-    });
+    }
     card.appendChild(row);
   } else {
     const row = el('div', 'input-row');
-
-    const minSpan = el('span', 'range-bounds', String(p.min));
     const range = document.createElement('input');
     range.type = 'range';
     range.id = 'range-' + p.key;
-    range.min = p.min;
-    range.max = p.max;
-    range.value = val;
+    range.min = p.min; range.max = p.max; range.value = val;
     const num = document.createElement('input');
     num.type = 'number';
     num.id = 'num-' + p.key;
-    num.min = p.min;
-    num.max = p.max;
-    num.value = val;
-    const maxSpan = el('span', 'range-bounds', String(p.max));
-
-    range.addEventListener('input', () => { num.value = range.value; setVal(p.key, parseInt(range.value)); });
-    num.addEventListener('input', () => { range.value = num.value; setVal(p.key, parseInt(num.value)); });
-
-    row.appendChild(minSpan);
+    num.min = p.min; num.max = p.max; num.step = 1; num.value = val;
+    range.addEventListener('input', () => { num.value = range.value; setVal(p.key, parseInt(range.value, 10)); });
+    // Clamp on blur: an out-of-range value would stop the daemon.
+    num.addEventListener('change', () => {
+      let v = parseInt(num.value, 10);
+      if (isNaN(v)) v = p.default;
+      v = Math.min(p.max, Math.max(p.min, v));
+      num.value = v; range.value = v; setVal(p.key, v);
+    });
+    row.appendChild(el('span', 'range-bounds', String(p.min)));
     row.appendChild(range);
     row.appendChild(num);
-    row.appendChild(maxSpan);
+    row.appendChild(el('span', 'range-bounds', String(p.max)));
     card.appendChild(row);
   }
-
-  if (p.sysctl) {
-    const hint = el('div', 'param-hint sysctl', 'sysctl: ' + p.sysctl);
-    card.appendChild(hint);
-  }
-  if (p.systemd) {
-    const hint = el('div', 'param-hint systemd', 'systemd: ' + p.systemd);
-    card.appendChild(hint);
-  }
-
   if (val !== p.default) card.classList.add('changed');
   return card;
 }
 
-function buildSection(sectionId) {
-  const section = PARAMS[sectionId];
+function buildSection(sid) {
+  const s = PARAMS[sid];
   const div = el('div', 'section');
-  div.id = 'section-' + sectionId;
-
+  div.id = 'section-' + sid;
   const hdr = el('div', 'section-header');
-  hdr.appendChild(el('h1', null, section.label));
-  hdr.appendChild(el('p', null, section.desc));
+  hdr.appendChild(el('h1', null, s.label));
+  hdr.appendChild(el('p', null, s.desc));
   div.appendChild(hdr);
-
-  section.params.forEach(p => div.appendChild(buildParamCard(p)));
+  s.params.forEach(p => div.appendChild(buildParamCard(p)));
   return div;
 }
 
 function buildOutputSection() {
   const div = el('div', 'section');
   div.id = 'section-output';
-
   const hdr = el('div', 'section-header');
-  hdr.appendChild(el('h1', null, 'Generate Config'));
-  hdr.appendChild(el('p', null, 'Preview and copy local_internal_options.conf'));
+  hdr.appendChild(el('h1', null, 'Generate config'));
+  hdr.appendChild(el('p', null, 'Deploy the changed-only file. A file that repeats every default pins today\\'s values and hides default changes in later Wazuh releases.'));
   div.appendChild(hdr);
 
+  const toolbar = el('div', 'toolbar');
+  const copyBtn = el('button', 'btn btn-primary', 'Copy');
+  copyBtn.id = 'copy-btn';
+  copyBtn.addEventListener('click', copyConf);
+  const dlBtn = el('button', 'btn btn-secondary', 'Download');
+  dlBtn.addEventListener('click', downloadConf);
+  const resetBtn = el('button', 'btn btn-danger', 'Reset to defaults');
+  resetBtn.addEventListener('click', () => applyPreset('default'));
+  [copyBtn, dlBtn, resetBtn].forEach(b => toolbar.appendChild(b));
+  div.appendChild(toolbar);
+
   const tabBar = el('div', 'tab-bar');
-  ['conf', 'diff'].forEach((t, i) => {
-    const tab = el('div', 'tab' + (i === 0 ? ' active' : ''), t === 'conf' ? 'Full config' : 'Changed only');
+  [['diff', 'Changed only'], ['conf', 'All parameters (reference)']].forEach(([t, label], i) => {
+    const tab = el('div', 'tab' + (i === 0 ? ' active' : ''), label);
     tab.dataset.tab = t;
     tab.addEventListener('click', () => switchTab(t));
     tabBar.appendChild(tab);
   });
   div.appendChild(tabBar);
-
-  ['conf', 'diff'].forEach((t, i) => {
+  ['diff', 'conf'].forEach((t, i) => {
     const tc = el('div', 'tab-content' + (i === 0 ? ' active' : ''));
     tc.id = 'tab-' + t;
-    if (t === 'conf') {
-      const toolbar = el('div', 'toolbar');
-      const copyBtn = el('button', 'btn btn-primary', 'Copy to clipboard');
-      copyBtn.id = 'copy-btn';
-      copyBtn.addEventListener('click', copyConf);
-      const dlBtn = el('button', 'btn btn-secondary', 'Download');
-      dlBtn.addEventListener('click', downloadConf);
-      const resetBtn = el('button', 'btn btn-danger', 'Reset all to defaults');
-      resetBtn.addEventListener('click', () => { values = {}; location.reload(); });
-      toolbar.appendChild(copyBtn);
-      toolbar.appendChild(dlBtn);
-      toolbar.appendChild(resetBtn);
-      tc.appendChild(toolbar);
-    }
     const out = el('div', 'output-section');
     const pre = el('pre');
     pre.id = 'out-' + t;
@@ -626,8 +521,8 @@ function buildSystemSection() {
   const div = el('div', 'section');
   div.id = 'section-system';
   const hdr = el('div', 'section-header');
-  hdr.appendChild(el('h1', null, 'System-Level Hints'));
-  hdr.appendChild(el('p', null, 'Kernel, systemd, and limits changes to support your tuning.'));
+  hdr.appendChild(el('h1', null, 'Apply and verify'));
+  hdr.appendChild(el('p', null, 'Steps and OS checks for the current values.'));
   div.appendChild(hdr);
   const content = el('div');
   content.id = 'sys-content';
@@ -645,39 +540,31 @@ function buildMain() {
 
 function showSection(id) {
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.section === id));
   document.getElementById('section-' + id).classList.add('active');
-  document.querySelectorAll('.nav-item').forEach(b => {
-    if (b.dataset.section === id) b.classList.add('active');
-  });
   if (id === 'output') updateOutput();
   if (id === 'system') updateSystemHints();
 }
 
 function setVal(key, val) {
-  const all = Object.values(PARAMS).flatMap(s => s.params);
-  const p = all.find(x => x.key === key);
-  val = isNaN(val) ? p.default : val;
   values[key] = val;
   const card = document.getElementById('card-' + key);
-  if (card) card.classList.toggle('changed', val !== p.default);
+  if (card) card.classList.toggle('changed', val !== ALL[key].default);
+  refreshNav();
 }
 
 function generateConf(changedOnly) {
-  const lines = [
-    '# /var/ossec/etc/local_internal_options.conf',
-    '# Generated by wazuh-tuner -- DO NOT edit internal_options.conf directly',
-    '# Date: ' + new Date().toISOString().split('T')[0],
-    '',
-  ];
-  Object.entries(PARAMS).forEach(([sid, section]) => {
-    const ps = section.params.filter(p => changedOnly ? getValue(p.key) !== p.default : true);
+  const lines = ['# /var/ossec/etc/local_internal_options.conf',
+                 '# Checked against Wazuh ' + WAZUH_VERSION + ' internal_options.conf ranges.', ''];
+  let n = 0;
+  Object.values(PARAMS).forEach(section => {
+    const ps = section.params.filter(p => !changedOnly || getValue(p.key) !== p.default);
     if (!ps.length) return;
-    lines.push('# --- ' + section.label + ' ---');
-    ps.forEach(p => lines.push(p.key + '=' + getValue(p.key)));
+    lines.push('# ' + section.label);
+    ps.forEach(p => { lines.push(p.key + '=' + getValue(p.key)); n++; });
     lines.push('');
   });
-  if (changedOnly && lines.length <= 5) return '# No parameters changed from defaults.';
+  if (changedOnly && n === 0) return '# No parameter differs from the defaults.';
   return lines.join('\\n');
 }
 
@@ -687,176 +574,198 @@ function updateOutput() {
 }
 
 function switchTab(tab) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelector('[data-tab="' + tab + '"]').classList.add('active');
-  document.getElementById('tab-' + tab).classList.add('active');
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === 'tab-' + tab));
 }
 
 function copyConf() {
-  navigator.clipboard.writeText(generateConf(false)).then(() => {
+  navigator.clipboard.writeText(generateConf(true)).then(() => {
     const btn = document.getElementById('copy-btn');
-    btn.textContent = 'Copied!';
-    btn.style.background = '#3fb950';
-    setTimeout(() => { btn.textContent = 'Copy to clipboard'; btn.style.background = ''; }, 1500);
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
   });
 }
 
 function downloadConf() {
   const a = document.createElement('a');
-  a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(generateConf(false));
+  a.href = 'data:text/plain;charset=utf-8,' + encodeURIComponent(generateConf(true) + '\\n');
   a.download = 'local_internal_options.conf';
   a.click();
 }
 
 function applyPreset(id) {
-  const preset = PRESETS[id];
-  values = { ...preset.values };
-  const all = Object.values(PARAMS).flatMap(s => s.params);
-  all.forEach(p => {
+  values = { ...PRESETS[id].values };
+  Object.values(ALL).forEach(p => {
     const v = getValue(p.key);
     const range = document.getElementById('range-' + p.key);
     const num = document.getElementById('num-' + p.key);
     if (range) range.value = v;
     if (num) num.value = v;
-    document.querySelectorAll('input[name="' + p.key + '"]').forEach(r => { r.checked = parseInt(r.value) === v; });
+    document.querySelectorAll('input[name="' + p.key + '"]').forEach(r => { r.checked = parseInt(r.value, 10) === v; });
     const card = document.getElementById('card-' + p.key);
     if (card) card.classList.toggle('changed', v !== p.default);
   });
+  refreshNav();
+  updateOutput();
+  updateSystemHints();
 }
 
-function addBlock(parent, cls, labelText, codeText) {
-  const box = el('div', cls, labelText);
-  parent.appendChild(box);
+function addBlock(parent, cls, label, code) {
+  parent.appendChild(el('div', cls, label));
+  if (!code) return;
   const out = el('div', 'output-section');
-  out.style.marginBottom = '16px';
-  const pre = el('pre');
-  pre.textContent = codeText;
-  out.appendChild(pre);
+  out.appendChild(el('pre', null, code));
   parent.appendChild(out);
 }
 
 function updateSystemHints() {
   const cont = document.getElementById('sys-content');
   while (cont.firstChild) cont.removeChild(cont.firstChild);
+  const changed = Object.values(ALL).filter(p => getValue(p.key) !== p.default);
 
-  const maxFD = Math.max(
-    getValue('analysisd.rlimit_nofile'),
-    getValue('remoted.rlimit_nofile'),
-    getValue('wazuh_db.rlimit_nofile'),
-    getValue('wazuh_modules.rlimit_nofile'),
-    getValue('logcollector.rlimit_nofile'),
-  );
-  const defaultMaxFD = Math.max(458752, 16384, 65536, 8192, 1100);
-  const fdChanged = maxFD !== defaultMaxFD;
-
-  const sendBuf = getValue('remoted.send_buffer_size');
-  const netChanged = sendBuf > 131072;
-  const auditChanged = getValue('syscheck.max_audit_entries') > 256;
-  const stackChanged = getValue('wazuh.thread_stack_size') > 8192;
-  const anyChanged = fdChanged || netChanged || auditChanged;
-
-  if (!anyChanged) {
-    const box = el('div', 'info-box', 'No system-level changes needed for current tuning. Tune parameters first.');
-    cont.appendChild(box);
-    return;
-  }
-
-  // sysctl
-  const sysctlLines = [];
-  if (fdChanged) {
-    sysctlLines.push('fs.file-max = ' + (maxFD * 3));
-    sysctlLines.push('fs.nr_open = ' + (maxFD * 3));
-  }
-  if (netChanged) {
-    sysctlLines.push('net.core.wmem_max = ' + (sendBuf * 2));
-    sysctlLines.push('net.core.rmem_max = ' + (sendBuf * 2));
-    sysctlLines.push('net.core.wmem_default = ' + sendBuf);
-    sysctlLines.push('net.core.rmem_default = ' + sendBuf);
-    sysctlLines.push('net.core.somaxconn = 65535');
-    sysctlLines.push('net.ipv4.tcp_max_syn_backlog = 65535');
-  }
-  if (auditChanged) {
-    sysctlLines.push('fs.inotify.max_user_watches = 524288');
-    sysctlLines.push('fs.inotify.max_queued_events = 32768');
-  }
-  if (sysctlLines.length) {
-    addBlock(cont, 'warn-box',
-      'Apply to /etc/sysctl.d/99-wazuh-tuner.conf then run: sysctl --system',
-      sysctlLines.join('\\n'));
-  }
-
-  // limits.conf
-  if (fdChanged) {
-    addBlock(cont, 'info-box', '/etc/security/limits.conf additions:',
-      'wazuh  soft  nofile  ' + maxFD + '\\n' +
-      'wazuh  hard  nofile  ' + maxFD + '\\n' +
-      'root   soft  nofile  ' + maxFD + '\\n' +
-      'root   hard  nofile  ' + maxFD);
-  }
-
-  // systemd override
-  const unitLines = ['[Service]', 'LimitNOFILE=' + maxFD, 'LimitNPROC=65536'];
-  if (stackChanged) unitLines.push('LimitSTACK=' + (getValue('wazuh.thread_stack_size') * 1024));
   addBlock(cont, 'info-box',
-    'systemd override: /etc/systemd/system/wazuh-manager.service.d/override.conf\\nThen: systemctl daemon-reload && systemctl restart wazuh-manager',
-    unitLines.join('\\n'));
+    '1. Write the changed-only file on every manager node that needs it. The cluster syncs client.keys from etc/, not this file.',
+    'install -o root -g wazuh -m 640 local_internal_options.conf /var/ossec/etc/local_internal_options.conf');
+  addBlock(cont, 'info-box',
+    '2. Restart and confirm no daemon exited. Out-of-range or non-numeric values stop the daemon at start.',
+    'systemctl restart wazuh-manager\\n/var/ossec/bin/wazuh-control status\\n' +
+    'grep -iE "invalid definition|could not set resource limit|cannot set stack" /var/ossec/logs/ossec.log | tail');
 
-  // apply order
-  addBlock(cont, 'warn-box',
-    'Apply order:\\n' +
-    '1. sysctl.d/99-wazuh-tuner.conf -> sysctl --system\\n' +
-    '2. /etc/security/limits.conf (pam_limits must be in /etc/pam.d/common-session)\\n' +
-    '3. systemd override -> systemctl daemon-reload\\n' +
-    '4. /var/ossec/etc/local_internal_options.conf (copy from Generate Config)\\n' +
-    '5. systemctl restart wazuh-manager\\n' +
-    '6. Verify: grep drops /var/ossec/var/run/wazuh-analysisd.state', '');
+  const fdKeys = Object.keys(ALL).filter(k => k.endsWith('.rlimit_nofile'));
+  if (changed.some(p => fdKeys.includes(p.key))) {
+    const procs = {analysisd: 'wazuh-analysisd', remoted: 'wazuh-remoted', wazuh_db: 'wazuh-db',
+                   logcollector: 'wazuh-logcollector', wazuh_modules: 'wazuh-modulesd'};
+    const cmds = fdKeys.map(k => {
+      const d = k.split('.')[0];
+      return 'grep "Max open files" /proc/$(pgrep -xo ' + procs[d] + ')/limits   # expect ' + getValue(k);
+    });
+    addBlock(cont, 'info-box',
+      'Open file limits: each daemon calls setrlimit() as root before it drops privileges, so the unit\\'s LimitNOFILE=65536 ' +
+      'and /etc/security/limits.conf do not cap it. The ceiling is fs.nr_open (kernel default 1048576). ' +
+      'fs.file-max is system-wide: check it, never lower it.',
+      cmds.join('\\n') + '\\nsysctl fs.nr_open fs.file-max\\ncat /proc/sys/fs/file-nr   # allocated, unused, max');
+  }
+
+  const queueBytes = changed.filter(p => p.key.endsWith('_queue_size') && p.key.startsWith('analysisd.'));
+  if (queueBytes.length) {
+    addBlock(cont, 'info-box',
+      'Queues: each analysisd queue allocates size x 8 bytes of pointers at start; events use memory only while queued. ' +
+      'Check the matching counters after a burst:',
+      'grep -E "dropped|queue_usage|queue_size" /var/ossec/var/run/wazuh-analysisd.state');
+  }
+
+  if (changed.some(p => p.key.startsWith('analysisd.') && p.key.endsWith('_threads'))) {
+    addBlock(cont, 'info-box', 'Threads: compare with the CPU count. 0 already means one thread per core for that pool.',
+      'nproc\\nps -o nlwp= -p $(pgrep -xo wazuh-analysisd)');
+  }
+
+  if (getValue('wazuh.thread_stack_size') > ALL['wazuh.thread_stack_size'].default) {
+    addBlock(cont, 'warn-box',
+      'thread_stack_size: virtual memory grows by (new - 8192) KiB for each thread in every daemon. ' +
+      'Raise it only after a stack overflow crash.', '');
+  }
+
+  if (getValue('syscheck.max_audit_entries') !== ALL['syscheck.max_audit_entries'].default) {
+    addBlock(cont, 'info-box',
+      'Whodata uses audit rules, not inotify. Check the audit backlog and lost counter. ' +
+      'Realtime mode (not whodata) uses inotify and needs fs.inotify.max_user_watches above the watched directory count.',
+      'auditctl -s\\nauditctl -l | grep -c wazuh_fim\\nsysctl fs.inotify.max_user_watches');
+  }
+
+  if (changed.some(p => p.key.endsWith('.debug') && getValue(p.key) > 0)) {
+    addBlock(cont, 'warn-box', 'Debug is on. Revert to 0 after the test: debug output fills /var/ossec/logs quickly.', '');
+  }
+
+  if (getValue('remoted.send_buffer_size') !== ALL['remoted.send_buffer_size'].default) {
+    addBlock(cont, 'info-box',
+      'remoted.send_buffer_size is a user-space queue per agent. net.core.wmem_max does not limit it and needs no change.', '');
+  }
+
+  addBlock(cont, 'info-box', '3. Rollback: restore the previous file (or remove the changed lines) and restart wazuh-manager.', '');
 }
 
 buildNav();
 buildPresets();
 buildMain();
+refreshNav();
 </script>
 </body>
 </html>"""
 
 
-@app.route("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
+def render_page():
+    return (HTML_TEMPLATE
+            .replace("__PARAMS__", json.dumps(PARAMS))
+            .replace("__PRESETS__", json.dumps(PRESETS))
+            .replace("__VERSION__", json.dumps(WAZUH_VERSION)))
 
 
-@app.route("/api/params")
-def api_params():
-    return jsonify(PARAMS)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind() calls socket.getfqdn(), which can block for seconds on reverse DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
-@app.route("/api/presets")
-def api_presets():
-    return jsonify(PRESETS)
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def do_GET(self):
+        if self.path == "/":
+            self._send(200, render_page(), "text/html; charset=utf-8")
+        elif self.path == "/api/params":
+            self._json(200, PARAMS)
+        elif self.path == "/api/presets":
+            self._json(200, PRESETS)
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/generate":
+            return self._json(404, {"error": "not found"})
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 65536:
+                return self._json(413, {"error": "request too large"})
+            data = json.loads(self.rfile.read(length) or b"{}")
+            values = data.get("values", {})
+            if not isinstance(values, dict):
+                raise ValueError
+        except (ValueError, AttributeError):
+            return self._json(400, {"error": "body must be JSON: {\"values\": {key: int}}"})
+        clean, errors = validate(values)
+        if errors:
+            return self._json(400, {"errors": errors})
+        self._json(200, {"config": generate(clean, changed_only=data.get("changed_only", True) is not False)})
 
 
-@app.route("/api/generate", methods=["POST"])
-def api_generate():
-    data = request.json or {}
-    user_values = data.get("values", {})
-    lines = [
-        "# /var/ossec/etc/local_internal_options.conf",
-        "# Generated by wazuh-tuner",
-        "",
-    ]
-    for section_id, section in PARAMS.items():
-        section_lines = []
-        for p in section["params"]:
-            v = user_values.get(p["key"], p["default"])
-            if str(v) != str(p["default"]):
-                section_lines.append(f"{p['key']}={v}")
-        if section_lines:
-            lines.append(f"# --- {section['label']} ---")
-            lines.extend(section_lines)
-            lines.append("")
-    return jsonify({"config": "\n".join(lines)})
+def main():
+    ap = argparse.ArgumentParser(description="Wazuh manager local_internal_options.conf tuner")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (default 127.0.0.1; the UI has no authentication)")
+    ap.add_argument("--port", type=int, default=7437)
+    ap.add_argument("--check", metavar="INTERNAL_OPTIONS_CONF",
+                    help="compare built-in defaults with an internal_options.conf and exit")
+    args = ap.parse_args()
+    if args.check:
+        sys.exit(check_defaults(args.check))
+    server = Server((args.host, args.port), Handler)
+    print(f"wazuh-tuner on http://{args.host}:{args.port}/ (Wazuh {WAZUH_VERSION} parameters)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=7437, debug=False)
+    main()
