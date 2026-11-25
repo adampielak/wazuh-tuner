@@ -2,7 +2,8 @@
 """Wazuh manager local_internal_options.conf tuning UI.
 
 Parameter names, defaults and ranges match the getDefine_Int() calls in the
-Wazuh v4.14.10 source. A value outside the range, or one that is not a plain
+Wazuh v4.14.10 source; the two rule_tree_memory_* options use getDefine_String()
+with a size or percent format. A value outside the range, or one that is not a plain
 non-negative integer, makes the daemon exit at start.
 
 Run:   python3 wazuh-tuner.py [--host 127.0.0.1] [--port 7437]
@@ -20,6 +21,29 @@ WAZUH_VERSION = "4.14.10"
 
 def p(key, default, lo, hi, desc):
     return {"key": key, "default": default, "min": lo, "max": hi, "desc": desc}
+
+
+def size_p(key, default, desc):
+    # Text option parsed by w_rule_tree_read_threshold(): bytes, N[KMGB], N% (1..100) or 0.
+    return {"key": key, "default": default, "kind": "size", "desc": desc}
+
+
+# w_parse_size() suffixes, case-insensitive. 4.14.10 sscanf ignores trailing junk; this is stricter.
+SIZE_RE = re.compile(r"(\d+)([KkMmGgBb]?)")
+SIZE_MULT = {"": 1, "b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
+
+def parse_size(raw):
+    """Return ('pct', n), ('bytes', n) or None when analysisd would exit with INV_DEF."""
+    s = str(raw).strip()
+    m = re.fullmatch(r"(\d+)%", s)
+    if m:
+        n = int(m.group(1))
+        return ("pct", n) if 1 <= n <= 100 else None
+    m = SIZE_RE.fullmatch(s)
+    if not m:
+        return None
+    return ("bytes", int(m.group(1)) * SIZE_MULT[m.group(2).lower()])
 
 
 QUEUE_MAX = 2000000
@@ -61,6 +85,13 @@ PARAMS = {
             p("analysisd.min_rotate_interval", 600, 10, 86400, "Minimum seconds between output file rotations."),
             p("analysisd.state_interval", 5, 0, 86400, "Seconds between wazuh-analysisd.state updates (0 = off)."),
             p("analysisd.debug", 0, 0, 2, "Debug level. 2 floods ossec.log; do not keep it in production."),
+            size_p("analysisd.rule_tree_memory_warning", "25%",
+                   "New in 4.14.10. Rule tree size that logs warning 7621 while loading rules. Bytes, N K/M/G, "
+                   "or 1%..100% of physical RAM (cgroup limit in a container); 0 = off. Converted to nodes "
+                   "(32 B each on 64-bit); the start log shows the result as INFO 'Rule tree threshold'."),
+            size_p("analysisd.rule_tree_memory_limit", "0",
+                   "New in 4.14.10. Rule tree size that stops loading: error 5108 names the rule that crossed it. "
+                   "Same format; 0 = off (default). Must exceed the warning, else error 5109 and analysisd exits."),
         ],
     },
     "remoted": {
@@ -240,6 +271,12 @@ def validate(values):
         if spec is None:
             errors.append(f"{key}: unknown parameter")
             continue
+        if spec.get("kind") == "size":
+            if isinstance(raw, bool) or parse_size(raw) is None:
+                errors.append(f"{key}: '{raw}' is not a size (bytes, N K/M/G, 1%..100%, 0)")
+                continue
+            clean[key] = str(raw).strip()
+            continue
         if isinstance(raw, bool) or not re.fullmatch(r"\d+", str(raw).strip()):
             errors.append(f"{key}: '{raw}' is not a non-negative integer")
             continue
@@ -248,6 +285,11 @@ def validate(values):
             errors.append(f"{key}: {v} outside [{spec['min']}..{spec['max']}]")
             continue
         clean[key] = v
+    w = parse_size(clean.get("analysisd.rule_tree_memory_warning", "25%"))
+    lim = parse_size(clean.get("analysisd.rule_tree_memory_limit", "0"))
+    # Same unit only: mixing % and bytes depends on the node's RAM (checked by analysisd, error 5109).
+    if w and lim and w[1] and lim[1] and w[0] == lim[0] and w[1] >= lim[1]:
+        errors.append("analysisd.rule_tree_memory_limit must exceed rule_tree_memory_warning (error 5109)")
     return clean, errors
 
 
@@ -417,12 +459,28 @@ function buildParamCard(p) {
   const card = el('div', 'param-card');
   card.id = 'card-' + p.key;
   const keyLine = el('div', 'param-key', p.key);
-  keyLine.appendChild(el('span', 'param-badge', 'default ' + p.default + ', range ' + p.min + '..' + p.max));
+  keyLine.appendChild(el('span', 'param-badge', 'default ' + p.default +
+    (p.kind === 'size' ? ', bytes, K/M/G or 1%..100%' : ', range ' + p.min + '..' + p.max)));
   card.appendChild(keyLine);
   card.appendChild(el('div', 'param-desc', p.desc));
 
   const val = getValue(p.key);
-  if (p.min === 0 && (p.max === 1 || p.max === 2)) {
+  if (p.kind === 'size') {
+    const row = el('div', 'input-row');
+    const txt = document.createElement('input');
+    txt.type = 'text';
+    txt.id = 'num-' + p.key;
+    txt.value = val;
+    // Revert invalid input: analysisd exits on a value it cannot parse.
+    txt.addEventListener('change', () => {
+      let v = txt.value.trim();
+      const m = /^(\\d+)%$/.exec(v);
+      if (!(m ? +m[1] >= 1 && +m[1] <= 100 : /^\\d+[KkMmGgBb]?$/.test(v))) v = p.default;
+      txt.value = v; setVal(p.key, v);
+    });
+    row.appendChild(txt);
+    card.appendChild(row);
+  } else if (p.min === 0 && (p.max === 1 || p.max === 2)) {
     const row = el('div', 'radio-row');
     for (let o = 0; o <= p.max; o++) {
       const lbl = el('label');
@@ -674,6 +732,12 @@ function updateSystemHints() {
 
   if (changed.some(p => p.key.endsWith('.debug') && getValue(p.key) > 0)) {
     addBlock(cont, 'warn-box', 'Debug is on. Revert to 0 after the test: debug output fills /var/ossec/logs quickly.', '');
+  }
+
+  if (['analysisd.rule_tree_memory_warning', 'analysisd.rule_tree_memory_limit'].some(k => getValue(k) !== ALL[k].default)) {
+    addBlock(cont, 'info-box',
+      'Rule tree thresholds are read at start. Check the computed node counts and any 7621/5108/5109 message:',
+      "grep -E 'Rule tree|7621|5108|5109' /var/ossec/logs/ossec.log | tail");
   }
 
   if (getValue('remoted.send_buffer_size') !== ALL['remoted.send_buffer_size'].default) {

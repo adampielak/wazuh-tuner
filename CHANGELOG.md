@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-25
+
+- Added `analysisd.rule_tree_memory_warning` (default `25%`) and `analysisd.rule_tree_memory_limit` (default `0`), new in Wazuh 4.14.10 (`src/analysisd/rules.c` `w_rule_tree_read_threshold`).
+- New `size` parameter kind: bytes, `N` + K/M/G/B, `1%..100%`, `0`; text input in the UI, server validation, limit-above-warning check (error 5109) for same-unit values.
+- Apply tab: grep hint for `Rule tree` / 7621 / 5108 / 5109 in `ossec.log`.
+- README: 83 options, rule tree row in "Facts behind the hints".
+
 ## 2026-11-14
 
 - README: link to wazuh5-tuner for Wazuh 5; license badge and section corrected to Apache-2.0 (matches LICENSE).
