@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 Local web UI that writes `/var/ossec/etc/local_internal_options.conf` for a Wazuh manager.
-It lists 81 manager options with the defaults and ranges taken from the Wazuh 4.14.10 source,
+It lists 83 manager options with the defaults and ranges taken from the Wazuh 4.14.10 source,
 blocks values the daemons would reject, and shows the commands to apply and check the result.
 
 One file, Python standard library only, no install step.
@@ -90,6 +90,7 @@ Checked in the v4.14.10 source:
 | `remoted.tcp_keep*` | set per socket | kernel `tcp_keepalive_*` sysctls are not used for agent sockets. |
 | `wazuh.thread_stack_size` | `pthread_attr_setstacksize()` | No ulimit or systemd change. Memory grows with threads x stack. |
 | `syscheck.max_audit_entries` | whodata audit rules | Check `auditctl -s` (backlog, lost). inotify limits apply to realtime mode, not whodata. |
+| `analysisd.rule_tree_memory_warning` / `_limit` (new in 4.14.10) | text value: bytes, `N` + `K`/`M`/`G`, `1%`..`100%` of physical RAM (cgroup limit in a container), or `0` = off; converted to rule tree nodes of 32 B (64-bit) | Default warning `25%` logs `INFO: Rule tree threshold 'analysisd.rule_tree_memory_warning' set to N nodes` at every start; this is not an error. Crossing the warning logs 7621, crossing the limit stops rule loading with 5108, limit not above warning exits with 5109. `0%`, `101%`, `1.5G` exit with INV_DEF. |
 | Cluster | the master syncs only `client.keys` from `etc/` | Deploy `local_internal_options.conf` to each node yourself. |
 
 ## Deploy

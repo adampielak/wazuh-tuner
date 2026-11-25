@@ -19,6 +19,9 @@ spec.loader.exec_module(tuner)
 class ParamTable(unittest.TestCase):
     def test_defaults_inside_ranges(self):
         for key, p in tuner.ALL_PARAMS.items():
+            if p.get("kind") == "size":
+                self.assertIsNotNone(tuner.parse_size(p["default"]), key)
+                continue
             self.assertLessEqual(p["min"], p["default"], key)
             self.assertLessEqual(p["default"], p["max"], key)
             self.assertGreaterEqual(p["min"], 0, f"{key}: negative values stop the daemon")
@@ -41,6 +44,24 @@ class Validate(unittest.TestCase):
             "analysisd.debug": True,
         })
         self.assertEqual(len(errors), 5)
+
+    def test_rule_tree_sizes(self):
+        ok = ["0", "25%", "100%", "512M", "2g", "1048576", "64K", "10b"]
+        bad = ["0%", "101%", "-1", "1.5G", "10MB", "10M\nx=1", "%", "abc", True]
+        for v in ok:
+            _, e = tuner.validate({"analysisd.rule_tree_memory_warning": v})
+            self.assertEqual(e, [], v)
+        for v in bad:
+            _, e = tuner.validate({"analysisd.rule_tree_memory_limit": v})
+            self.assertEqual(len(e), 1, v)
+        _, e = tuner.validate({"analysisd.rule_tree_memory_warning": "1G",
+                               "analysisd.rule_tree_memory_limit": "512M"})
+        self.assertEqual(len(e), 1)  # error 5109
+        _, e = tuner.validate({"analysisd.rule_tree_memory_limit": "20%"})
+        self.assertEqual(len(e), 1)  # below default warning 25%
+        clean, e = tuner.validate({"analysisd.rule_tree_memory_limit": "50%"})
+        self.assertEqual(e, [])
+        self.assertIn("analysisd.rule_tree_memory_limit=50%", tuner.generate(clean))
 
     def test_generate_changed_only(self):
         out = tuner.generate({"remoted.worker_pool": 8, "analysisd.debug": 0})
